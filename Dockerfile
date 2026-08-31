@@ -16,4 +16,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 10000
 
 # Render sets PORT. Timeout covers a long Hindi book plus OCR fallback.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --timeout 180 --workers 1 --threads 1 app:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --timeout 180 --workers 1 --threads 4 app:app"]

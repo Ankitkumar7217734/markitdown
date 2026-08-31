@@ -1,7 +1,10 @@
 import os
-import io
+import secrets
 import tempfile
-from flask import Flask, request, send_file, render_template_string, flash, redirect
+import threading
+from urllib.parse import quote
+
+from flask import Flask, Response, flash, redirect, render_template_string, request, url_for
 
 from markitdown import MarkItDown
 
@@ -14,13 +17,20 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB limit
 md = MarkItDown(enable_plugins=False)
 hindi_pdf.register(md)
 
+# One convert at a time: pdfium is not thread-safe, and a Free Render instance
+# has 512 MB. Starting two books at once OOMs the dyno and Render returns
+# "Not Found" (x-render-routing: no-server) until it comes back.
+_convert_lock = threading.Lock()
+_jobs_lock = threading.Lock()
+_jobs: dict[str, dict] = {}
+
 PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PDF to Markdown</title>
+<title>File to Markdown</title>
 <style>
   :root {
     --bg: #efe8dc;
@@ -112,7 +122,7 @@ PAGE = """
     display: grid;
     place-items: center;
     font-family: ui-sans-serif, system-ui, sans-serif;
-    font-size: 0.72rem;
+    font-size: 0.62rem;
     font-weight: 700;
     letter-spacing: 0.04em;
     color: var(--accent);
@@ -170,13 +180,13 @@ PAGE = """
 <body>
   <main class="wrap">
     <p class="mark">Markitdown</p>
-    <h1>PDF to Markdown</h1>
-    <p class="lede">Hindi and English documents, decoded as text you can keep.</p>
+    <h1>File to Markdown</h1>
+    <p class="lede">Upload any document. Hindi and English PDFs are decoded as text you can keep.</p>
     <form class="card" method="post" action="/convert" enctype="multipart/form-data">
       <label class="drop">
-        <input id="file" type="file" name="file" accept="application/pdf" required>
-        <div class="glyph">PDF</div>
-        <strong>Choose a PDF</strong>
+        <input id="file" type="file" name="file" required>
+        <div class="glyph">FILE</div>
+        <strong>Choose a file</strong>
         <span id="fname">or drop it here · up to 32 MB</span>
       </label>
       <button type="submit">Convert and download</button>
@@ -186,22 +196,150 @@ PAGE = """
         {% for m in messages %}<p class="msg" role="alert">{{ m }}</p>{% endfor %}
       {% endif %}
     {% endwith %}
-    <p class="hint">The Markdown file downloads when conversion finishes.</p>
+    <p class="hint">Keep this tab open. A long book can take a minute, then the file downloads.</p>
   </main>
   <script>
     document.getElementById("file").addEventListener("change", function () {
       document.getElementById("fname").textContent =
         this.files[0] ? this.files[0].name : "or drop it here · up to 32 MB";
     });
+    document.querySelector("form").addEventListener("submit", function () {
+      var button = this.querySelector("button");
+      button.disabled = true;
+      button.textContent = "Starting…";
+    });
   </script>
 </body>
 </html>
 """
 
+WAIT = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="2">
+<title>Converting…</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: #efe8dc;
+    color: #1c1915;
+    font-family: "Iowan Old Style", Palatino, Georgia, serif;
+    text-align: center;
+  }
+  p { color: #6b6458; }
+  .mark {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 0.72rem;
+    font-weight: 650;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #b5441f;
+  }
+</style>
+</head>
+<body>
+  <main>
+    <p class="mark">Markitdown</p>
+    <h1>Converting</h1>
+    <p>{{ filename }}</p>
+    <p>Keep this tab open. The Markdown file will download automatically.</p>
+  </main>
+</body>
+</html>
+"""
 
-@app.route("/", methods=["GET"])
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
+@app.route("/", methods=["GET", "POST"])
 def index():
+    if request.method == "POST":
+        return convert()
     return render_template_string(PAGE)
+
+
+@app.errorhandler(413)
+def too_large(_error):
+    flash("That file is over the 32 MB upload limit.")
+    return redirect("/")
+
+
+def _md_name(filename: str) -> str:
+    base = os.path.splitext(os.path.basename(filename or "document"))[0].strip() or "document"
+    return base.replace('"', "").replace("\r", "").replace("\n", "") + ".md"
+
+
+def _safe_suffix(filename: str) -> str:
+    ext = os.path.splitext(os.path.basename(filename or ""))[1].lower()
+    cleaned = "." + "".join(c for c in ext if c.isalnum())[:12]
+    return cleaned if len(cleaned) > 1 else ".bin"
+
+
+def _download(text: str, filename: str) -> Response:
+    name = _md_name(filename)
+    ascii_name = name.encode("ascii", "ignore").decode() or "download.md"
+    return Response(
+        text.encode("utf-8"),
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(name)}'
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _convert_job(job_id: str, data: bytes, filename: str) -> None:
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=_safe_suffix(filename), delete=False) as tmp:
+            tmp.write(data)
+            path = tmp.name
+        with _convert_lock:
+            result = md.convert(path)
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["text"] = result.text_content or ""
+    except Exception as error:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "error"
+            _jobs[job_id]["error"] = str(error)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _start_job(data: bytes, filename: str) -> str:
+    job_id = secrets.token_urlsafe(8)
+    with _jobs_lock:
+        if len(_jobs) > 16:
+            for key, job in list(_jobs.items()):
+                if job["status"] != "pending":
+                    del _jobs[key]
+                    break
+        _jobs[job_id] = {
+            "status": "pending",
+            "filename": filename,
+            "text": "",
+            "error": "",
+        }
+    threading.Thread(
+        target=_convert_job, args=(job_id, data, filename), daemon=True
+    ).start()
+    return job_id
 
 
 @app.route("/convert", methods=["POST"])
@@ -211,33 +349,34 @@ def convert():
         flash("No file selected.")
         return redirect("/")
 
-    if not file.filename.lower().endswith(".pdf"):
-        flash("Please upload a PDF file.")
+    data = file.read()
+    if not data:
+        flash("That file is empty.")
         return redirect("/")
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        file.save(tmp.name)
-        tmp_path = tmp.name
+    return redirect(url_for("job", job_id=_start_job(data, file.filename)))
 
-    try:
-        result = md.convert(tmp_path)
-    except Exception as e:
-        flash(f"Conversion failed: {e}")
+
+@app.route("/jobs/<job_id>")
+def job(job_id: str):
+    with _jobs_lock:
+        found = _jobs.get(job_id)
+        if found is None:
+            flash("That conversion expired. Upload the file again.")
+            return redirect("/")
+        snapshot = dict(found)
+    if snapshot["status"] == "error":
+        flash(f"Conversion failed: {snapshot['error']}")
         return redirect("/")
-    finally:
-        os.remove(tmp_path)
-
-    md_bytes = io.BytesIO(result.text_content.encode("utf-8"))
-    out_name = os.path.splitext(file.filename)[0] + ".md"
-
-    return send_file(
-        md_bytes,
-        mimetype="text/markdown",
-        as_attachment=True,
-        download_name=out_name,
-    )
+    if snapshot["status"] == "done":
+        return _download(snapshot["text"], snapshot["filename"])
+    return render_template_string(WAIT, filename=snapshot["filename"])
 
 
 if __name__ == "__main__":
+    assert _md_name("volumeH1.1.pdf") == "volumeH1.1.md"
+    assert _md_name("notes.docx") == "notes.md"
+    assert _safe_suffix("notes.docx") == ".docx"
+    assert _safe_suffix("noext") == ".bin"
     port = int(os.environ.get("PORT", "5001"))
     app.run(host="0.0.0.0", port=port, debug=False)

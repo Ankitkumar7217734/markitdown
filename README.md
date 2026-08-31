@@ -1,7 +1,8 @@
-# PDF to Markdown Web App
+# File to Markdown Web App
 
-Converts uploaded PDFs to Markdown with MarkItDown, plus a Hindi-aware PDF
-path for documents MarkItDown alone cannot read.
+Converts uploaded files to Markdown with MarkItDown, plus a Hindi-aware PDF
+path for documents MarkItDown alone cannot read. PDFs, Word, Excel, PowerPoint,
+HTML, images, and other formats MarkItDown supports are accepted.
 
 ## Install
 
@@ -16,7 +17,7 @@ brew install tesseract tesseract-lang        # optional, for scanned pages
 python app.py
 ```
 
-Open http://localhost:5001, upload a PDF, download the `.md`.
+Open http://localhost:5001, upload a file, download the `.md`.
 
 Port 5001 is used locally because macOS AirPlay Receiver occupies 5000. On
 Render the process binds to `$PORT` instead.
@@ -32,12 +33,19 @@ is in the image.
 3. Or **New → Web Service**, connect the repo, and set:
    - Runtime: **Docker**
    - Dockerfile path: `Dockerfile`
-   - Health check path: `/`
+   - Health check path: `/health` (not `/` — a convert on `/` would fail the
+     health check, Render would kill the service, and the URL would return
+     `Not Found`)
 4. Set `SECRET_KEY` in the dashboard if the blueprint did not generate one.
 
-First boot builds the image (a few minutes). Free instances spin down when
-idle; the next request waits for a cold start. A long Hindi book needs the
-180s gunicorn timeout already in the Dockerfile.
+Upload starts a background job and the tab waits on `/jobs/…` until the
+Markdown file downloads. That keeps Render's health check alive while a long
+Hindi PDF is converting. Free instances are 0.1 CPU / 512 MB and spin down
+when idle; the next request waits about a minute for a cold start.
+
+If the public URL shows a black **Not Found** page (`x-render-routing:
+no-server`), open the Render dashboard and **Manual Deploy → Deploy latest
+commit**. The service was likely killed after a convert exhausted memory.
 
 Local check of the same stack:
 
