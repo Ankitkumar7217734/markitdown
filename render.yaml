@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: markitdown
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: HINDI_PDF_OCR_MAX_PAGES
+        value: "40"
